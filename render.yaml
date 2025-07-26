@@ -1,13 +1,15 @@
 services:
   - type: web
-    name: tg-psych-bot
-    runtime: python
-    buildCommand: ""
-    startCommand: python main.py
+    name: telegram-trading-bot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
     envVars:
       - key: TG_BOT_TOKEN
-        value: your-telegram-token
+        value: YOUR_TOKEN_HERE
       - key: GIGACHAT_CLIENT_ID
-        value: your-client-id
+        value: YOUR_CLIENT_ID
       - key: GIGACHAT_CLIENT_SECRET
-        value: your-client-secret
+        value: YOUR_CLIENT_SECRET
+      - key: WEBHOOK_URL
+        value: https://your-subdomain.onrender.com
