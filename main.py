@@ -11,6 +11,10 @@ from telegram.ext import (
     Application
 )
 import asyncio
+import signal
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -38,6 +42,46 @@ keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# Глобальная переменная для контроля задач
+monitoring_task = None
+shutdown_event = asyncio.Event()
+
+class HealthHandler(BaseHTTPRequestHandler):
+    """HTTP обработчик для health check"""
+    
+    def do_GET(self):
+        if self.path == '/health' or self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            response_data = {
+                "status": "ok",
+                "service": "telegram-bot",
+                "active_users": len(user_contexts),
+                "timestamp": int(time.time())
+            }
+            
+            self.wfile.write(str(response_data).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+    
+    def log_message(self, format, *args):
+        # Отключаем логи HTTP сервера чтобы не засорять консоль
+        pass
+
+def start_health_server():
+    """Запуск HTTP сервера для health check"""
+    port = int(os.getenv('PORT', 8000))
+    try:
+        server = HTTPServer(('0.0.0.0', port), HealthHandler)
+        print(f"🌐 HTTP сервер запущен на порту {port}")
+        server.serve_forever()
+    except Exception as e:
+        print(f"❌ Ошибка запуска HTTP сервера: {e}")
+
 def get_access_token():
     auth_string = f"{CLIENT_ID}:{CLIENT_SECRET}"
     auth_base64 = base64.b64encode(auth_string.encode()).decode()
@@ -49,17 +93,22 @@ def get_access_token():
         "RqUID": str(uuid.uuid4())
     }
 
-    response = requests.post(
-        "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
-        headers=headers,
-        data={"scope": "GIGACHAT_API_PERS"},
-        verify=False
-    )
+    try:
+        response = requests.post(
+            "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
+            headers=headers,
+            data={"scope": "GIGACHAT_API_PERS"},
+            verify=False,
+            timeout=10
+        )
 
-    if response.status_code == 200:
-        return response.json().get("access_token")
-    else:
-        print("❌ Ошибка авторизации:", response.status_code, response.text)
+        if response.status_code == 200:
+            return response.json().get("access_token")
+        else:
+            print("❌ Ошибка авторизации:", response.status_code, response.text)
+            return None
+    except Exception as e:
+        print(f"❌ Ошибка подключения к GigaChat: {e}")
         return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -142,23 +191,27 @@ async def continue_conversation(user_id, user_text, update):
         context_list.append({"role": "system", "content": SYSTEM_PROMPT})
     context_list.append({"role": "user", "content": user_text})
 
-    response = requests.post(
-        "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        },
-        json={"model": "GigaChat", "messages": context_list},
-        verify=False
-    )
+    try:
+        response = requests.post(
+            "https://gigachat.devices.sberbank.ru/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            },
+            json={"model": "GigaChat", "messages": context_list},
+            verify=False,
+            timeout=30
+        )
 
-    if response.ok:
-        reply = response.json()["choices"][0]["message"]["content"]
-        for symbol in ["*", "_", "`", "#"]:
-            reply = reply.replace(symbol, "")
-        context_list.append({"role": "assistant", "content": reply})
-    else:
-        reply = f"⚠️ Ошибка GigaChat: {response.status_code}"
+        if response.ok:
+            reply = response.json()["choices"][0]["message"]["content"]
+            for symbol in ["*", "_", "`", "#"]:
+                reply = reply.replace(symbol, "")
+            context_list.append({"role": "assistant", "content": reply})
+        else:
+            reply = f"⚠️ Ошибка GigaChat: {response.status_code}"
+    except Exception as e:
+        reply = f"⚠️ Ошибка соединения: {str(e)}"
 
     await update.message.reply_text(reply)
 
@@ -173,56 +226,131 @@ async def continue_dialog(user_id, update):
     await continue_conversation(user_id, prompt, update)
 
 async def monitor_silence(app: Application):
-    while True:
-        now = time.time()
-        for user_id, last_active in list(user_last_active.items()):
-            if user_id in dialog_ended:
-                continue
+    """Мониторинг молчания пользователей"""
+    print("🔄 Запущен мониторинг молчания")
+    try:
+        while not shutdown_event.is_set():
+            now = time.time()
+            for user_id, last_active in list(user_last_active.items()):
+                if user_id in dialog_ended:
+                    continue
 
-            if now - last_active > 120:
-                count = user_silence_prompts.get(user_id, 0)
-                if count >= 3:
-                    continue  # больше не писать
+                if now - last_active > 120:  # 2 минуты молчания
+                    count = user_silence_prompts.get(user_id, 0)
+                    if count >= 3:
+                        continue  # больше не писать
 
-                user_last_active[user_id] = now
-                user_silence_prompts[user_id] = count + 1
-                try:
-                    chat_context = user_contexts.get(user_id, [])
-                    if not chat_context:
-                        continue
+                    user_last_active[user_id] = now
+                    user_silence_prompts[user_id] = count + 1
+                    
+                    try:
+                        chat_context = user_contexts.get(user_id, [])
+                        if not chat_context:
+                            continue
 
-                    prompt = "Пользователь молчит. Спросить добрый, поддерживающий вопрос, чтобы gently продолжить разговор."
-                    chat_context.append({"role": "user", "content": prompt})
+                        prompt = "Пользователь молчит. Спросить добрый, поддерживающий вопрос, чтобы gently продолжить разговор."
+                        chat_context.append({"role": "user", "content": prompt})
 
-                    class DummyMessage:
-                        def __init__(self, chat_id, bot):
-                            self.chat_id = chat_id
-                            self._bot = bot
+                        # Создаем объект для отправки сообщения
+                        class DummyMessage:
+                            def __init__(self, chat_id, bot):
+                                self.chat_id = chat_id
+                                self._bot = bot
 
-                        async def reply_text(self, msg):
-                            await self._bot.send_message(self.chat_id, msg)
+                            async def reply_text(self, msg, **kwargs):
+                                await self._bot.send_message(self.chat_id, msg, **kwargs)
 
-                    dummy_update = type('dummy', (), {})()
-                    dummy_update.message = DummyMessage(user_id, app.bot)
+                        dummy_update = type('dummy', (), {})()
+                        dummy_update.message = DummyMessage(user_id, app.bot)
 
-                    await continue_conversation(user_id, prompt, dummy_update)
+                        await continue_conversation(user_id, prompt, dummy_update)
 
-                except Exception as e:
-                    print(f"⚠️ Ошибка при автосообщении: {e}")
-        await asyncio.sleep(30)
+                    except Exception as e:
+                        print(f"⚠️ Ошибка при автосообщении пользователю {user_id}: {e}")
+
+            # Ждем 30 секунд или сигнал завершения
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=30.0)
+                break  # Если получили сигнал завершения
+            except asyncio.TimeoutError:
+                continue  # Продолжаем цикл после таймаута
+                
+    except asyncio.CancelledError:
+        print("🛑 Мониторинг молчания отменен")
+    except Exception as e:
+        print(f"❌ Ошибка в мониторинге молчания: {e}")
+    finally:
+        print("🏁 Мониторинг молчания завершен")
 
 async def post_init(application: Application):
-    application.create_task(monitor_silence(application))
+    """Инициализация после запуска приложения"""
+    global monitoring_task
+    print("🚀 Инициализация приложения")
+    monitoring_task = asyncio.create_task(monitor_silence(application))
+
+async def post_shutdown(application: Application):
+    """Очистка при завершении работы"""
+    global monitoring_task
+    print("🛑 Завершение работы приложения")
+    shutdown_event.set()
+    
+    if monitoring_task and not monitoring_task.done():
+        monitoring_task.cancel()
+        try:
+            await monitoring_task
+        except asyncio.CancelledError:
+            pass
+
+def signal_handler(signum, frame):
+    """Обработчик сигнала завершения"""
+    print(f"🛑 Получен сигнал {signum}, завершаем работу...")
+    shutdown_event.set()
 
 def main():
-    app = ApplicationBuilder().token(TG_BOT_TOKEN).post_init(post_init).build()
+    # Проверяем наличие необходимых переменных окружения
+    if not TG_BOT_TOKEN:
+        print("❌ Ошибка: TG_BOT_TOKEN не установлен")
+        sys.exit(1)
+    
+    if not CLIENT_ID or not CLIENT_SECRET:
+        print("❌ Ошибка: GIGACHAT_CLIENT_ID или GIGACHAT_CLIENT_SECRET не установлены")
+        sys.exit(1)
 
+    # Запускаем HTTP сервер в отдельном потоке
+    print("🌐 Запуск HTTP сервера...")
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+
+    # Регистрируем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Создаем приложение
+    app = (ApplicationBuilder()
+           .token(TG_BOT_TOKEN)
+           .post_init(post_init)
+           .post_shutdown(post_shutdown)
+           .build())
+
+    # Добавляем обработчики
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("✅ Бот запущен.")
-    app.run_polling()
+    print("✅ Telegram бот запущен и готов к работе")
+    
+    try:
+        # Запускаем бота
+        app.run_polling(
+            drop_pending_updates=True,
+            close_loop=False
+        )
+    except KeyboardInterrupt:
+        print("🛑 Получен сигнал прерывания")
+    except Exception as e:
+        print(f"❌ Критическая ошибка: {e}")
+    finally:
+        print("🏁 Бот завершил работу")
 
 if __name__ == "__main__":
     main()
