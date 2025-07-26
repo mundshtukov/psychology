@@ -4,24 +4,29 @@ import base64
 import time
 import requests
 import urllib3
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, ContextTypes,
-    MessageHandler, CommandHandler, filters,
-    Application
-)
 import asyncio
+from flask import Flask, request
+from threading import Thread
+from telegram import Update, Bot, ReplyKeyboardMarkup
+from telegram.ext import (
+    Application, ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+TOKEN = os.getenv("TG_BOT_TOKEN")
 CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID")
 CLIENT_SECRET = os.getenv("GIGACHAT_CLIENT_SECRET")
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL")  # from Render env var
+
+bot = Bot(token=TOKEN)
+app_flask = Flask(__name__)
 
 user_contexts = {}
 user_last_active = {}
-user_auto_message_count = {}
-user_said_thanks = {}
+user_silence_prompts = {}
+dialog_ended = set()
 
 SYSTEM_PROMPT = (
     "Ты — добрый и тёплый психолог, который помогает трейдерам. "
@@ -56,83 +61,74 @@ def get_access_token():
         verify=False
     )
 
-    if response.status_code == 200:
-        return response.json().get("access_token")
-    else:
-        print("❌ Ошибка авторизации:", response.status_code, response.text)
-        return None
+    return response.json().get("access_token") if response.ok else None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.chat_id
+    user_id = update.effective_chat.id
     user_contexts[user_id] = []
     user_last_active[user_id] = time.time()
-    user_auto_message_count[user_id] = 0
-    user_said_thanks[user_id] = False
+    user_silence_prompts[user_id] = 0
+    dialog_ended.discard(user_id)
 
-    text = (
+    await update.message.reply_text(
         "👋 Привет!\n\n"
-        "Я — помощник для трейдеров.  \n"
-        "Бывает сложно... тревога, страх, выгорание.  \n"
-        "Я рядом, чтобы поддержать 💬\n\n"
-        "Вот что я умею:\n"
-        "🟢 Начать — начать новый разговор\n"
-        "🙏 Спасибо — завершить беседу\n"
-        "🔁 Продолжить — если не знаешь, что сказать, я сам подскажу вопрос\n\n"
-        "🟢 Нажми «Начать», и я задам первый вопрос"
+        "Я — помощник для трейдеров.\n"
+        "Тревога, страх, усталость — я рядом 💬\n\n"
+        "🟢 Начать — начать разговор\n"
+        "🙏 Спасибо — завершить\n"
+        "🔁 Продолжить — если не знаешь, что сказать\n\n"
+        "👇 Нажми «Начать»", reply_markup=keyboard
     )
-    await update.message.reply_text(text, reply_markup=keyboard)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_last_active[update.message.chat_id] = time.time()
+    user_last_active[update.effective_chat.id] = time.time()
     await update.message.reply_text(
-        "ℹ️ Я здесь, чтобы поддержать тебя, когда трудно.\n\n"
-        "🟢 Начать — начать новый разговор\n"
-        "🙏 Спасибо — завершить беседу\n"
+        "ℹ️ Я поддержу тебя, когда трудно 💛\n\n"
+        "🟢 Начать — с начала\n"
+        "🙏 Спасибо — закончить беседу\n"
         "🔁 Продолжить — если не знаешь, что сказать\n\n"
-        "Пиши, когда будешь готов 💛",
-        reply_markup=keyboard
+        "Пиши, когда будешь готов", reply_markup=keyboard
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.chat_id
+    user_id = update.effective_chat.id
     text = update.message.text.strip()
     user_last_active[user_id] = time.time()
-    user_auto_message_count[user_id] = 0
-    user_said_thanks[user_id] = False
+    user_silence_prompts[user_id] = 0
+    dialog_ended.discard(user_id)
 
-    if user_id not in user_contexts:
-        user_contexts[user_id] = []
+    user_contexts.setdefault(user_id, [])
 
     if text == "🟢 Начать":
         user_contexts[user_id] = []
         await update.message.reply_text(
-            "📝 Расскажи, что у тебя сейчас на душе.\n\n"
-            "Можешь коротко описать, что беспокоит:\n"
+            "📝 Расскажи, что у тебя на душе.\n\n"
             "• тревога перед сделкой\n"
             "• чувство вины после потерь\n"
-            "• страх снова начать торговать\n"
-            "• выгорание или усталость\n\n"
-            "Пиши как чувствуешь — можно простыми словами. Я здесь, чтобы поддержать тебя 💛"
+            "• страх снова начать\n"
+            "• выгорание\n\n"
+            "Пиши простыми словами — я здесь 💛"
         )
         return
 
-    elif text == "🙏 Спасибо":
-        user_said_thanks[user_id] = True
+    if text == "🙏 Спасибо":
+        dialog_ended.add(user_id)
         await update.message.reply_text(
-            "✨ Рад был быть рядом. Помни — ты не один.\n"
-            "Если снова понадобится поддержка, просто напиши. Я рядом 💬"
+            "✨ Рад был быть рядом. Ты не один.\n"
+            "Если понадобится поддержка — напиши 💬"
         )
         return
 
-    elif text == "🔁 Продолжить":
-        return await continue_dialog(user_id, update)
+    if text == "🔁 Продолжить":
+        await continue_dialog(user_id, update)
+        return
 
     await continue_conversation(user_id, text, update)
 
 async def continue_conversation(user_id, user_text, update):
     access_token = get_access_token()
     if not access_token:
-        await update.message.reply_text("⚠️ Не удалось подключиться к GigaChat.")
+        await update.message.reply_text("⚠️ Ошибка подключения к GigaChat.")
         return
 
     context_list = user_contexts[user_id]
@@ -156,17 +152,17 @@ async def continue_conversation(user_id, user_text, update):
             reply = reply.replace(symbol, "")
         context_list.append({"role": "assistant", "content": reply})
     else:
-        reply = f"⚠️ Ошибка GigaChat: {response.status_code}"
+        reply = f"⚠️ GigaChat ошибка: {response.status_code}"
 
     await update.message.reply_text(reply)
 
 async def continue_dialog(user_id, update):
     context_list = user_contexts[user_id]
     if not context_list:
-        await update.message.reply_text("Пока что у нас не было беседы. Нажми «Начать», чтобы начать с чистого листа 😊")
+        await update.message.reply_text("Мы ещё не начали. Нажми «Начать» 😊")
         return
 
-    prompt = "Пользователь не знает, что написать. Помоги продолжить разговор, задай простой, добрый вопрос в контексте."
+    prompt = "Пользователь не знает, что сказать. Поддержи добрым вопросом."
     context_list.append({"role": "user", "content": prompt})
     await continue_conversation(user_id, prompt, update)
 
@@ -174,50 +170,45 @@ async def monitor_silence(app: Application):
     while True:
         now = time.time()
         for user_id, last_active in list(user_last_active.items()):
-            if user_said_thanks.get(user_id):
+            if user_id in dialog_ended:
                 continue
 
-            if now - last_active > 120 and user_auto_message_count.get(user_id, 0) < 3:
+            if now - last_active > 120:
+                count = user_silence_prompts.get(user_id, 0)
+                if count >= 3:
+                    continue
+
                 user_last_active[user_id] = now
-                user_auto_message_count[user_id] = user_auto_message_count.get(user_id, 0) + 1
-
+                user_silence_prompts[user_id] = count + 1
                 try:
-                    chat_context = user_contexts.get(user_id, [])
-                    if not chat_context:
-                        continue
-
-                    prompt = "Пользователь молчит. Спроси добрый, поддерживающий вопрос, чтобы gently продолжить разговор."
-                    chat_context.append({"role": "user", "content": prompt})
-
-                    class DummyMessage:
-                        def __init__(self, chat_id, bot):
-                            self.chat_id = chat_id
-                            self._bot = bot
-
-                        async def reply_text(self, msg):
-                            await self._bot.send_message(self.chat_id, msg)
-
-                    dummy_update = type('dummy', (), {})()
-                    dummy_update.message = DummyMessage(user_id, app.bot)
-
-                    await continue_conversation(user_id, prompt, dummy_update)
-
+                    prompt = "Пользователь молчит. Спроси добрый вопрос, чтобы продолжить беседу."
+                    user_contexts[user_id].append({"role": "user", "content": prompt})
+                    await bot.send_message(chat_id=user_id, text="🤔 Всё ли в порядке? Я рядом, если нужно поговорить 💬")
                 except Exception as e:
-                    print(f"⚠️ Ошибка при автосообщении: {e}")
+                    print("⚠️ Автосообщение ошибка:", e)
         await asyncio.sleep(30)
 
-async def post_init(application: Application):
-    application.create_task(monitor_silence(application))
+@app_flask.route(f"/webhook/{TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), bot)
+    asyncio.run(application.process_update(update))
+    return "OK", 200
 
-def main():
-    app = ApplicationBuilder().token(TG_BOT_TOKEN).post_init(post_init).build()
+@app_flask.route("/")
+def index():
+    return "🤖 Бот работает!"
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+async def post_init(app: Application):
+    await bot.set_webhook(f"{WEBHOOK_URL}/webhook/{TOKEN}")
+    app.create_task(monitor_silence(app))
 
-    print("✅ Бот запущен.")
-    app.run_polling()
+def run_flask():
+    app_flask.run(host="0.0.0.0", port=10000)
 
 if __name__ == "__main__":
-    main()
+    application = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    Thread(target=run_flask).start()
